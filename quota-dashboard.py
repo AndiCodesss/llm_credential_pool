@@ -36,6 +36,7 @@ from urllib.parse import urlparse, parse_qs
 AUTH_DIR  = os.environ.get("CLIPROXY_AUTH_DIR", os.path.join(os.path.expanduser("~"), ".cli-proxy-api"))
 CONFIG_PATH = os.environ.get("CLIPROXY_CONFIG", os.path.join(AUTH_DIR, "config.yaml"))
 CODEX_GLOB = "codex-*.json"
+AUTH_GLOB = "*.json"
 USAGE_URL = "https://chatgpt.com/backend-api/codex/usage"
 DASH_HOST = os.environ.get("DASH_HOST", "127.0.0.1")
 DASH_PORT = int(os.environ.get("DASH_PORT", "8788"))
@@ -148,16 +149,22 @@ def probe_file(path):
         with open(path, "r", encoding="utf-8") as fh:
             d = json.load(fh)
     except Exception as e:                                     # noqa: BLE001
-        return {"email": name, "file": name, "plan": "?", "state": "error",
-                "detail": f"unreadable token file: {e}"}
+        return {"email": name, "file": name, "provider": "?", "plan": "?",
+                "state": "error", "detail": f"unreadable token file: {e}"}
 
+    provider = (d.get("type") or name.split("-", 1)[0]).lower()
     email = d.get("email") or name
-    base = {"email": email, "file": name, "plan": (d.get("account_type") or "?")}
+    base = {"email": email, "file": name, "provider": provider, "plan": provider}
     if d.get("disabled"):
         return {**base, "state": "disabled"}
     token = d.get("access_token")
     if not token:
         return {**base, "state": "error", "detail": "no access token in file"}
+
+    # Only Codex/ChatGPT exposes the zero-cost usage endpoint we chart.
+    if provider != "codex":
+        return {**base, "state": "ok", "tracked": False,
+                "detail": f"{provider} account â€” logged in (usage not tracked here)"}
 
     try:
         u = codex_usage(token, d.get("account_id"))
@@ -169,19 +176,20 @@ def probe_file(path):
 
     rl = u.get("rate_limit") or {}
     reached = bool(rl.get("limit_reached"))
-    return {**base,
+    return {**base, "tracked": True,
             "email": u.get("email") or email,
-            "plan": u.get("plan_type") or base["plan"],
+            "plan": u.get("plan_type") or "codex",
             "state": "limited" if reached else "ok",
             "primary": make_window(rl.get("primary_window")),
             "secondary": make_window(rl.get("secondary_window"))}
 
 
 def refresh_once():
-    files = sorted(glob.glob(os.path.join(AUTH_DIR, CODEX_GLOB)))
+    files = [p for p in sorted(glob.glob(os.path.join(AUTH_DIR, AUTH_GLOB)))
+             if not os.path.basename(p).lower().startswith("config")]
     if not files:
         return {"ok": False, "ts": time.time(), "settings": read_settings(),
-                "error": f"no {CODEX_GLOB} files in {AUTH_DIR}", "accounts": []}
+                "error": f"no account json files in {AUTH_DIR}", "accounts": []}
     with ThreadPoolExecutor(max_workers=8) as ex:
         accounts = list(ex.map(probe_file, files))
 
@@ -231,7 +239,8 @@ def force_refresh():
 def resolve_file(file):
     """Validate a client-supplied file name and return its absolute path."""
     base = os.path.basename(file or "")
-    if not base or base != file or not fnmatch(base, CODEX_GLOB):
+    if (not base or base != file or not fnmatch(base, AUTH_GLOB)
+            or base.lower().startswith("config")):
         raise ValueError("invalid account file")
     path = os.path.join(AUTH_DIR, base)
     if not os.path.isfile(path):
@@ -412,7 +421,7 @@ PAGE = r"""<!doctype html>
 <body>
 <div class="wrap">
   <header>
-    <h1>Codex accounts</h1>
+    <h1>Accounts</h1>
     <select id="provider" class="prov" title="provider to log in">
       <option value="codex">Codex / ChatGPT</option>
       <option value="claude">Claude</option>
@@ -429,7 +438,7 @@ PAGE = r"""<!doctype html>
     <div class="grid" id="grid"></div>
     <aside class="side"><h2>Broker settings</h2><div id="settings"></div></aside>
   </div>
-  <footer>5h &amp; weekly usage Â· sparkline = 5h trend (last hour) Â· zero-cost read Â· refreshes every __REFRESH__s</footer>
+  <footer>bars = current 5h &amp; weekly usage Â· sparkline = 5h-limit usage over the last hour Â· refreshes every __REFRESH__s</footer>
 </div>
 <script>
 const REFRESH = __REFRESH__ * 1000;
@@ -501,9 +510,9 @@ function render(d){
     const plan=(a.plan||"").toLowerCase();
     const enable = a.state==="disabled";
     let inner;
-    if(a.state==="ok"||a.state==="limited"){
+    if((a.state==="ok"||a.state==="limited") && a.tracked){
       inner=`<div class="bars">${bar("5h",a.primary)}${bar("weekly",a.secondary)}</div>
-        <div class="trend"><span class="lbl">5h ~</span>${sparkline(a.spark)}</div>`;
+        <div class="trend"><span class="lbl" title="5-hour usage over the last hour">5h</span>${sparkline(a.spark)}</div>`;
     }else{ inner=`<div class="note">${esc(a.detail||stateLabel(a.state))}</div>`; }
     return `<div class="card" data-file="${esc(a.file)}" data-email="${esc(a.email)}">
       <div class="top">
