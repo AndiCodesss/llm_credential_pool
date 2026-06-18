@@ -67,6 +67,14 @@ TRASH_DIR = os.path.join(AUTH_DIR, "removed-accounts")
 LOGIN_FLAGS = {"codex": "-codex-login", "claude": "-claude-login",
                "gemini": "-login", "qwen": "-qwen-login", "xai": "-xai-login"}
 
+# --- cross-model fallback gateway (served on the same port as the dashboard) ---
+BROKER_BASE = os.environ.get("CLIPROXY_UPSTREAM", "http://127.0.0.1:8317").rstrip("/")
+CHAINS_FILE = os.path.join(APP_DIR, "fallback-chains.json")
+PROXY_TIMEOUT = int(os.environ.get("DASH_PROXY_TIMEOUT", "300"))
+DEFAULT_CHAINS = {"auto": ["gpt-5.5", "claude-sonnet-4-6"]}
+FALLBACK_STATUSES = set(int(x) for x in
+    os.environ.get("FALLBACK_STATUSES", "408,409,429,500,502,503,504,529").split(",") if x.strip())
+
 _snapshot = {"ok": False, "error": "starting up...", "accounts": [], "ts": 0}
 _history = {}
 _claude_cache = {}                                 # file -> {data, ts} (slow-polled, 429-prone)
@@ -387,6 +395,34 @@ def set_setting(key, value):
     os.replace(tmp, CONFIG_PATH)
 
 
+def broker_forward(path, method, headers, body):
+    req = urllib.request.Request(BROKER_BASE + path, data=body, method=method)
+    for k, v in headers.items():
+        req.add_header(k, v)
+    return urllib.request.urlopen(req, timeout=PROXY_TIMEOUT)
+
+
+def load_chains():
+    try:
+        with open(CHAINS_FILE, "r", encoding="utf-8") as fh:
+            d = json.load(fh)
+        if isinstance(d, dict) and d:
+            return {str(k): [str(m) for m in v] for k, v in d.items() if isinstance(v, list)}
+    except Exception:                                          # noqa: BLE001
+        pass
+    return dict(DEFAULT_CHAINS)
+
+
+def save_chains(d):
+    clean = {str(k).strip(): [str(m).strip() for m in v if str(m).strip()]
+             for k, v in (d or {}).items() if str(k).strip() and isinstance(v, list)}
+    tmp = CHAINS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(clean, fh, indent=2)
+    os.replace(tmp, CHAINS_FILE)
+    return clean
+
+
 def start_login(provider="codex"):
     flag = LOGIN_FLAGS.get(provider, "-codex-login")
     if not os.path.exists(BROKER_EXE):
@@ -485,6 +521,15 @@ PAGE = r"""<!doctype html>
   .sw input:checked + .slider:before{transform:translateX(13px);background:#fff}
   .sselect,.snum{background:#0d1117;color:var(--txt);border:1px solid var(--line);border-radius:6px;font-size:11px;padding:2px 5px}
   .snum{width:52px}
+  .side-h2b{font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--dim);
+            margin:14px 0 8px;font-weight:600;border-top:1px solid var(--line);padding-top:12px}
+  .chrow{display:flex;gap:5px;margin-bottom:5px;align-items:center}
+  .chrow input{background:#0d1117;color:var(--txt);border:1px solid var(--line);border-radius:6px;font-size:11px;padding:3px 6px;min-width:0}
+  .chrow .ca{width:36%}.chrow .cm{flex:1}
+  .chrow .cx{background:none;border:none;color:var(--dim);cursor:pointer;font-size:14px;padding:0 3px;flex:0 0 auto}
+  .chbtns{display:flex;gap:6px;margin-top:6px}
+  .chbtns button{font-size:11px;font-weight:600;border:1px solid var(--line);background:#0d1117;color:var(--txt);border-radius:6px;padding:4px 9px;cursor:pointer}
+  #chSave{background:#1f6feb;border:none;color:#fff}
   .err{background:#1b1216;border:1px solid #3d1d22;color:#ffb4ab;padding:14px;border-radius:10px}
   footer{flex:0 0 auto;color:var(--grey);font-size:10.5px;text-align:center}
   @media(max-width:760px){.main{flex-direction:column}.side{flex:0 0 auto}}
@@ -507,7 +552,10 @@ PAGE = r"""<!doctype html>
   <div id="toast" class="toast"></div>
   <div class="main">
     <div class="grid" id="grid"></div>
-    <aside class="side"><h2>Broker settings</h2><div id="settings"></div></aside>
+    <aside class="side">
+      <h2>Broker settings</h2><div id="settings"></div>
+      <h2 class="side-h2b">Fallback chains</h2><div id="chains"></div>
+    </aside>
   </div>
   <footer>bars = current 5h &amp; weekly usage Â· sparkline = 5h-limit usage over the last hour Â· refreshes every __REFRESH__s</footer>
 </div>
@@ -687,7 +735,38 @@ document.getElementById("settings").addEventListener("change", async (e)=>{
   }catch(err){ toast("Request failed: "+err, true); }
 });
 
-load(); setInterval(load,REFRESH); setInterval(tick,1000);
+function chainRow(alias,models){
+  return `<div class="chrow"><input class="ca" value="${esc(alias)}" placeholder="alias">`+
+    `<input class="cm" value="${esc((models||[]).join(', '))}" placeholder="model-a, model-b">`+
+    `<button class="cx" title="remove">Ã—</button></div>`;
+}
+function renderChains(chains){
+  const el=document.getElementById("chains");
+  el.innerHTML=Object.entries(chains||{}).map(([a,m])=>chainRow(a,m)).join("")
+    +`<div class="chbtns"><button id="chAdd">+ chain</button><button id="chSave">Save</button></div>`
+    +`<div class="sexp">A request to an alias tries each model leftâ†’right, falling to the next on a rate-limit. Point your client's base URL at this server's <b>/v1</b> and use an alias (or any model) as the model name.</div>`;
+  el.onclick=(e)=>{ if(e.target.classList.contains("cx")) e.target.closest(".chrow").remove(); };
+  document.getElementById("chAdd").onclick=()=>el.querySelector(".chbtns").insertAdjacentHTML("beforebegin",chainRow("",[]));
+  document.getElementById("chSave").onclick=saveChains;
+}
+async function loadChains(){
+  try{ const r=await fetch("/api/chains",{cache:"no-store"}); renderChains((await r.json()).chains); }
+  catch(e){ document.getElementById("chains").innerHTML=`<div class="sexp">chains unavailable</div>`; }
+}
+async function saveChains(){
+  const obj={};
+  document.querySelectorAll("#chains .chrow").forEach(r=>{
+    const a=r.querySelector(".ca").value.trim();
+    const m=r.querySelector(".cm").value.split(",").map(s=>s.trim()).filter(Boolean);
+    if(a&&m.length) obj[a]=m;
+  });
+  try{
+    const r=await fetch("/api/chains",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({chains:obj})});
+    const j=await r.json();
+    if(j.ok){ toast("Fallback chains saved"); renderChains(j.chains); } else toast(j.error||"save failed",true);
+  }catch(e){ toast("save failed: "+e,true); }
+}
+load(); loadChains(); setInterval(load,REFRESH); setInterval(tick,1000);
 </script>
 </body></html>
 """
@@ -707,6 +786,86 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, obj):
         self._send(200, json.dumps(obj), "application/json")
 
+    # ---- inference proxy (cross-model fallback) ----
+    def _proxy_headers(self):
+        h = {"Content-Type": "application/json"}
+        if self.headers.get("Authorization"):
+            h["Authorization"] = self.headers["Authorization"]
+        return h
+
+    def _relay(self, resp, status=None):
+        body = resp.read()
+        self.send_response(status or getattr(resp, "status", 200))
+        self.send_header("Content-Type", resp.headers.get("Content-Type", "application/json"))
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _stream(self, resp):
+        self.send_response(200)
+        self.send_header("Content-Type", resp.headers.get("Content-Type", "text/event-stream"))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        while True:
+            chunk = resp.read(2048)
+            if not chunk:
+                break
+            self.wfile.write(chunk)
+            self.wfile.flush()
+
+    def _proxy_error(self, code, msg):
+        self._send(code, json.dumps({"error": {"message": msg, "type": "proxy_error"}}),
+                   "application/json")
+
+    def _passthrough_v1(self, method, body):
+        try:
+            self._relay(broker_forward(self.path, method, self._proxy_headers(), body or None))
+        except urllib.error.HTTPError as e:
+            self._relay(e, e.code)
+        except Exception as e:                                 # noqa: BLE001
+            self._proxy_error(502, f"upstream error: {e}")
+
+    def _v1_models(self):
+        try:
+            data = json.loads(broker_forward("/v1/models", "GET", self._proxy_headers(), None).read())
+        except urllib.error.HTTPError as e:
+            return self._relay(e, e.code)
+        except Exception as e:                                 # noqa: BLE001
+            return self._proxy_error(502, f"upstream error: {e}")
+        for name in load_chains():
+            data.setdefault("data", []).append({"id": name, "object": "model", "owned_by": "fallback"})
+        self._json(data)
+
+    def _chat_fallback(self, raw):
+        try:
+            payload = json.loads(raw or b"{}")
+        except ValueError:
+            return self._passthrough_v1("POST", raw)
+        chain = load_chains().get(payload.get("model"), [payload.get("model")])
+        stream = bool(payload.get("stream"))
+        last = None
+        for i, cand in enumerate(chain):
+            payload["model"] = cand
+            data = json.dumps(payload).encode("utf-8")
+            try:
+                resp = broker_forward("/v1/chat/completions", "POST", self._proxy_headers(), data)
+            except urllib.error.HTTPError as e:
+                last = e
+                if e.code in FALLBACK_STATUSES and i < len(chain) - 1:
+                    continue                                   # this model is down â€” try the next
+                return self._relay(e, e.code)
+            except Exception as e:                             # noqa: BLE001
+                last = e
+                if i < len(chain) - 1:
+                    continue
+                return self._proxy_error(502, f"upstream error: {e}")
+            return self._stream(resp) if stream else self._relay(resp)
+        if isinstance(last, urllib.error.HTTPError):
+            self._relay(last, last.code)
+        else:
+            self._proxy_error(502, "all models in the chain failed")
+
     def do_GET(self):
         path = self.path.split("?", 1)[0]
         if path in ("/", "/index.html"):
@@ -716,19 +875,36 @@ class Handler(BaseHTTPRequestHandler):
             with _lock:
                 snap = dict(_snapshot)
             self._json(snap)
+        elif path == "/api/chains":
+            self._json({"chains": load_chains()})
+        elif path == "/v1/models":
+            self._v1_models()
+        elif path.startswith("/v1/"):
+            self._passthrough_v1("GET", b"")
         else:
             self._send(404, "not found", "text/plain")
 
     def do_POST(self):
         u = urlparse(self.path)
         q = parse_qs(u.query)
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length) if length else b""
 
         def one(k, d=None):
             v = q.get(k)
             return v[0] if v else d
 
+        # inference proxy surface (cross-model fallback) â€” same port as the dashboard
+        if u.path == "/v1/chat/completions":
+            return self._chat_fallback(raw)
+        if u.path.startswith("/v1/"):
+            return self._passthrough_v1("POST", raw)
+
         try:
-            if u.path == "/api/add-account":
+            if u.path == "/api/chains":
+                body = json.loads(raw or b"{}")
+                self._json({"ok": True, "chains": save_chains(body.get("chains", body))})
+            elif u.path == "/api/add-account":
                 provider = (one("provider", "codex")).lower()
                 if one("dry"):
                     self._json({"ok": os.path.exists(BROKER_EXE), "dry": True, "exe": BROKER_EXE})

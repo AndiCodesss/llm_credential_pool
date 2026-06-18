@@ -10,6 +10,7 @@ __pycache__/
 # runtime
 *.tmp
 DASH_STOP
+fallback-chains.json
 removed-accounts/
 *.removed
 
