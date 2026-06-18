@@ -1,0 +1,20 @@
+# logs
+*.log
+dashboard.log
+add-account.log
+
+# python
+__pycache__/
+*.pyc
+
+# runtime
+*.tmp
+DASH_STOP
+removed-accounts/
+*.removed
+
+# never commit broker secrets if anyone drops them here
+config.yaml
+codex-*.json
+*-login.json
+auth*.json
