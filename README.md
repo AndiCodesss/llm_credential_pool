@@ -6,7 +6,11 @@ account's **5-hour** and **weekly** limit is used, when it resets, and which acc
 headroom right now.
 
 CLIProxyAPI lets local AI tools share a pool of ChatGPT subscription logins behind one
-endpoint and rotates between them. This is the missing dashboard on top of it.
+endpoint and rotates between them. This repo is a small self-hosted toolkit on top of it:
+
+- **`quota-dashboard.py`** — the dashboard described below.
+- **`fallback-proxy.py`** — cross-model fallback (e.g. gpt-5.5 → sonnet-4.6 when one is rate-limited).
+- **`broker-keepalive/`** — Windows scripts that keep the broker itself running 24/7.
 
 ## What it's good for
 
@@ -54,6 +58,38 @@ powershell -ExecutionPolicy Bypass -File setup-autostart.ps1
 
 Registers a hidden scheduled task that keeps the dashboard running at logon. Drop a
 `DASH_STOP` file next to the script to stop the self-restarting wrapper.
+
+## Cross-model fallback (`fallback-proxy.py`)
+
+CLIProxyAPI pools multiple accounts *per model*, but can't fall back across *different*
+models for OAuth subscription accounts. This tiny gateway adds it: a virtual model maps to
+an ordered list of real models, and a request to it tries each in turn, moving to the next
+on a rate-limit / server error.
+
+```sh
+python fallback-proxy.py        # listens on http://127.0.0.1:8789
+```
+
+Point your client at `:8789` instead of the broker and request a chain model (default
+`auto` = `gpt-5.5`, then `claude-sonnet-4-6`). Everything else is forwarded transparently,
+and your API key is passed straight through (no secrets stored). Edit `DEFAULT_CHAINS` in
+the file, or set `FALLBACK_CHAINS` (JSON), `FALLBACK_PORT`, `CLIPROXY_UPSTREAM`.
+
+> Note: this is the *right* place for cross-model fallback — the broker only fails over
+> across accounts of the **same** model, by design.
+
+## Keep the broker alive (`broker-keepalive/`, Windows)
+
+Scripts that keep CLIProxyAPI itself running hidden 24/7: a self-restarting wrapper
+(`run-broker.cmd`), hidden launchers, and a 5-minute watchdog. Install once:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File broker-keepalive\setup-cliproxyapi-tasks.ps1
+```
+
+Registers `CLIProxyAPI` (start at logon) + `CLIProxyAPI-Watchdog` (restart if it dies).
+Drop a `STOP` file in `~/.cli-proxy-api` to stop it. Assumes a standard CLIProxyAPI install
+at `%LOCALAPPDATA%\CLIProxyAPI\app`.
 
 ## License
 
