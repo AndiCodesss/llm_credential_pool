@@ -266,7 +266,7 @@ def refresh_once():
 
     for a in accounts:
         used = (a.get("primary") or {}).get("used")
-        h = _history.setdefault(a["email"], [])
+        h = _history.setdefault(a["file"], [])      # key by file: emails can collide across providers
         h.append(used)
         del h[:-HISTORY_LEN]
         a["spark"] = list(h)
