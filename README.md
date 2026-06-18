@@ -25,8 +25,10 @@ endpoint and rotates between them. This is the missing dashboard on top of it.
 - Disable / Enable, and Remove with a type-the-email confirmation (the token file is moved
   to `removed-accounts/`, never hard-deleted)
 - Editable broker-settings panel
-- One file, Python standard library only — no installs. Refreshes every minute at **zero
-  quota cost** (it reads `GET /backend-api/codex/usage`, which doesn't spend a message).
+- One file, Python standard library only — no installs. Refreshes at **zero quota cost** —
+  Codex via `GET /backend-api/codex/usage`, Claude via `GET /api/oauth/usage` (neither spends
+  a message; Claude is polled every ~5 min because Anthropic rate-limits it). Other providers
+  show as logged-in.
 
 ## Quick start
 

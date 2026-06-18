@@ -28,6 +28,7 @@ import time
 import urllib.request
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from fnmatch import fnmatch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -44,6 +45,9 @@ REFRESH_SECONDS = int(os.environ.get("DASH_REFRESH", "60"))
 HISTORY_LEN = 60
 HTTP_TIMEOUT = 12
 UA = "codex_cli_rs/0.114.0 (Windows 11; x86_64) cli"
+CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+CLAUDE_UA = "claude-code/1.0.0 (external, cli)"
+CLAUDE_USAGE_TTL = int(os.environ.get("DASH_CLAUDE_TTL", "300"))  # Anthropic rate-limits this hard
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 def _find_broker_exe():
@@ -65,6 +69,7 @@ LOGIN_FLAGS = {"codex": "-codex-login", "claude": "-claude-login",
 
 _snapshot = {"ok": False, "error": "starting up...", "accounts": [], "ts": 0}
 _history = {}
+_claude_cache = {}                                 # file -> {data, ts} (slow-polled, 429-prone)
 _lock = threading.Lock()
 
 
@@ -143,6 +148,70 @@ def make_window(w):
             "label": window_label(w.get("limit_window_seconds"))}
 
 
+def claude_usage(token):
+    req = urllib.request.Request(CLAUDE_USAGE_URL, headers={
+        "Authorization": "Bearer " + token,
+        "anthropic-version": "2023-06-01",
+        "anthropic-beta": "oauth-2025-04-20,claude-code-20250219",
+        "User-Agent": CLAUDE_UA,
+    })
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def make_claude_window(w, label):
+    if not isinstance(w, dict):
+        return None
+    util = w.get("utilization")
+    reset_at = reset_after = None
+    ra = w.get("resets_at")
+    if ra:
+        try:
+            reset_at = int(datetime.fromisoformat(ra).timestamp())
+            reset_after = max(0, reset_at - int(time.time()))
+        except Exception:                                      # noqa: BLE001
+            pass
+    return {"used": round(util) if isinstance(util, (int, float)) else None,
+            "reset_at": reset_at, "reset_after": reset_after, "label": label}
+
+
+def probe_claude(name, token, base):
+    """Claude usage via /api/oauth/usage â€” polled at most every CLAUDE_USAGE_TTL
+    seconds and cached, because Anthropic rate-limits this endpoint hard."""
+    now = time.time()
+    cached = _claude_cache.get(name)
+    data, stale = None, False
+    if cached and now - cached["ts"] < CLAUDE_USAGE_TTL:
+        data = cached["data"]
+    else:
+        try:
+            data = claude_usage(token)
+            _claude_cache[name] = {"data": data, "ts": now}
+        except urllib.error.HTTPError as e:
+            if cached:
+                data, stale = cached["data"], True            # keep last-known on 429/etc.
+            elif e.code == 401:
+                return {**base, "state": "autherr", "detail": "token expired / unauthorized"}
+            elif e.code == 429:
+                return {**base, "state": "ok", "tracked": False,
+                        "detail": "Claude usage rate-limited by Anthropic â€” retrying soon"}
+            else:
+                return {**base, "state": "ok", "tracked": False, "detail": f"usage HTTP {e.code}"}
+        except Exception as e:                                 # noqa: BLE001
+            if cached:
+                data, stale = cached["data"], True
+            else:
+                return {**base, "state": "ok", "tracked": False, "detail": str(e)[:80]}
+
+    fh = make_claude_window(data.get("five_hour"), "5h")
+    sd = make_claude_window(data.get("seven_day"), "weekly")
+    reached = ((fh and fh["used"] is not None and fh["used"] >= 100) or
+               (sd and sd["used"] is not None and sd["used"] >= 100))
+    return {**base, "tracked": True, "stale": stale,
+            "state": "limited" if reached else "ok",
+            "primary": fh, "secondary": sd}
+
+
 def probe_file(path):
     name = os.path.basename(path)
     try:
@@ -161,7 +230,9 @@ def probe_file(path):
     if not token:
         return {**base, "state": "error", "detail": "no access token in file"}
 
-    # Only Codex/ChatGPT exposes the zero-cost usage endpoint we chart.
+    if provider == "claude":
+        return probe_claude(name, token, base)
+    # Other providers don't expose a zero-cost usage endpoint we chart.
     if provider != "codex":
         return {**base, "state": "ok", "tracked": False,
                 "detail": f"{provider} account â€” logged in (usage not tracked here)"}
