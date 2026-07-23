@@ -3,9 +3,9 @@
 CLIProxyAPI account quota dashboard.
 
 A tiny, dependency-free (stdlib only) localhost page showing every logged-in
-Codex/ChatGPT account with progress bars for the 5-hour and weekly limits,
-a usage sparkline, the broker's routing settings, and per-account actions
-(add / disable / enable / remove).
+Codex/ChatGPT account with progress bars for each rate-limit window the
+provider reports, a usage sparkline, the broker's routing settings, and
+per-account actions (add / disable / enable / remove).
 
 Data sources (no management key required):
   * account list + OAuth tokens : the broker's own auth files in AUTH_DIR
@@ -34,7 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ---------------------------------------------------------------- config ----
-AUTH_DIR  = os.environ.get("CLIPROXY_AUTH_DIR", os.path.join(os.path.expanduser("~"), ".cli-proxy-api"))
+AUTH_DIR = os.environ.get("CLIPROXY_AUTH_DIR", os.path.join(os.path.expanduser("~"), ".cli-proxy-api"))
 CONFIG_PATH = os.environ.get("CLIPROXY_CONFIG", os.path.join(AUTH_DIR, "config.yaml"))
 CODEX_GLOB = "codex-*.json"
 AUTH_GLOB = "*.json"
@@ -48,14 +48,22 @@ UA = "codex_cli_rs/0.114.0 (Windows 11; x86_64) cli"
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 CLAUDE_UA = "claude-code/1.0.0 (external, cli)"
 CLAUDE_USAGE_TTL = int(os.environ.get("DASH_CLAUDE_TTL", "300"))  # Anthropic rate-limits this hard
+CLAUDE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"  # Claude Code public OAuth client
+CLAUDE_TOKEN_URL = "https://api.anthropic.com/v1/oauth/token"
+FAIL_COOLDOWN_START = 120  # failed probes back off (doubling) instead of retrying every refresh
+FAIL_COOLDOWN_MAX = 900
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
 def _find_broker_exe():
     env = os.environ.get("CLIPROXY_EXE")
     if env:
         return env
-    for p in (os.path.join(os.environ.get("LOCALAPPDATA", ""), "CLIProxyAPI", "app", "cli-proxy-api.exe"),
-              os.path.join(APP_DIR, "cli-proxy-api.exe")):
+    for p in (
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "CLIProxyAPI", "app", "cli-proxy-api.exe"),
+        os.path.join(APP_DIR, "cli-proxy-api.exe"),
+    ):
         if p and os.path.exists(p):
             return p
     return os.path.join(APP_DIR, "cli-proxy-api.exe")
@@ -64,20 +72,28 @@ def _find_broker_exe():
 BROKER_EXE = _find_broker_exe()
 LOGIN_LOG = os.path.join(APP_DIR, "add-account.log")
 TRASH_DIR = os.path.join(AUTH_DIR, "removed-accounts")
-LOGIN_FLAGS = {"codex": "-codex-login", "claude": "-claude-login",
-               "gemini": "-login", "qwen": "-qwen-login", "xai": "-xai-login"}
+LOGIN_FLAGS = {
+    "codex": "-codex-login",
+    "claude": "-claude-login",
+    "gemini": "-login",
+    "qwen": "-qwen-login",
+    "xai": "-xai-login",
+}
 
 # --- cross-model fallback gateway (served on the same port as the dashboard) ---
 BROKER_BASE = os.environ.get("CLIPROXY_UPSTREAM", "http://127.0.0.1:8317").rstrip("/")
 CHAINS_FILE = os.path.join(APP_DIR, "fallback-chains.json")
 PROXY_TIMEOUT = int(os.environ.get("DASH_PROXY_TIMEOUT", "300"))
 DEFAULT_CHAINS = {"auto": ["gpt-5.5", "claude-sonnet-4-6"]}
-FALLBACK_STATUSES = set(int(x) for x in
-    os.environ.get("FALLBACK_STATUSES", "408,409,429,500,502,503,504,529").split(",") if x.strip())
+FALLBACK_STATUSES = set(
+    int(x) for x in os.environ.get("FALLBACK_STATUSES", "408,409,429,500,502,503,504,529").split(",") if x.strip()
+)
 
 _snapshot = {"ok": False, "error": "starting up...", "accounts": [], "ts": 0}
 _history = {}
-_claude_cache = {}                                 # file -> {data, ts} (slow-polled, 429-prone)
+_claude_cache = {}  # file -> {data, ts} (slow-polled, 429-prone)
+_claude_fail = {}  # file -> {until, cooldown, err, state}
+_claude_refresh_lock = threading.Lock()
 _lock = threading.Lock()
 
 
@@ -86,7 +102,7 @@ def read_settings():
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
             txt = fh.read()
-    except Exception:                                          # noqa: BLE001
+    except Exception:  # noqa: BLE001
         return None
 
     def g(pat, default=None):
@@ -94,45 +110,80 @@ def read_settings():
         return m.group(1) if m else default
 
     host = g(r'^host:\s*"?([^"\n]*)"?') or "*"
-    port = g(r'^port:\s*(\d+)') or "?"
+    port = g(r"^port:\s*(\d+)") or "?"
     return [
-        {"label": "Bind", "type": "static", "value": f"{host}:{port}",
-         "explain": "Localhost only â€” not exposed to the network (read-only; a change needs a restart)."},
-        {"label": "Routing", "key": "strategy", "type": "enum",
-         "value": g(r'strategy:\s*"?([a-z-]+)"?', "round-robin"),
-         "options": ["round-robin", "fill-first"],
-         "explain": "round-robin spreads requests evenly across accounts; fill-first drains one before the next."},
-        {"label": "Session affinity", "key": "session-affinity", "type": "bool",
-         "value": g(r'session-affinity:\s*(true|false)', "false"),
-         "explain": "On: a conversation sticks to one account (keeps prompt cache + stable identity). "
-                    "Off: any account per request."},
-        {"label": "Switch on quota", "key": "switch-project", "type": "bool",
-         "value": g(r'switch-project:\s*(true|false)', "true"),
-         "explain": "On a limit, automatically fail over to another account."},
-        {"label": "Preview fallback", "key": "switch-preview-model", "type": "bool",
-         "value": g(r'switch-preview-model:\s*(true|false)', "false"),
-         "explain": "On: may downgrade to a cheaper/preview model on quota errors. Off: never."},
-        {"label": "Spend credits", "key": "antigravity-credits", "type": "bool",
-         "value": g(r'antigravity-credits:\s*(true|false)', "false"),
-         "explain": "On: may spend paid credits as a last resort. Off: never."},
-        {"label": "Request retries", "key": "request-retry", "type": "int",
-         "value": g(r'request-retry:\s*(\d+)', "0"),
-         "explain": "Retry a failed request this many times (403/408/5xx)."},
-        {"label": "Failover breadth", "key": "max-retry-credentials", "type": "int",
-         "value": g(r'max-retry-credentials:\s*(\d+)', "0"),
-         "explain": "Accounts to try on a hard failure (0 = all)."},
+        {
+            "label": "Bind",
+            "type": "static",
+            "value": f"{host}:{port}",
+            "explain": "Localhost only — not exposed to the network (read-only; a change needs a restart).",
+        },
+        {
+            "label": "Routing",
+            "key": "strategy",
+            "type": "enum",
+            "value": g(r'strategy:\s*"?([a-z-]+)"?', "round-robin"),
+            "options": ["round-robin", "fill-first"],
+            "explain": "round-robin spreads requests evenly across accounts; fill-first drains one before the next.",
+        },
+        {
+            "label": "Session affinity",
+            "key": "session-affinity",
+            "type": "bool",
+            "value": g(r"session-affinity:\s*(true|false)", "false"),
+            "explain": "On: a conversation sticks to one account (keeps prompt cache + stable identity). "
+            "Off: any account per request.",
+        },
+        {
+            "label": "Switch on quota",
+            "key": "switch-project",
+            "type": "bool",
+            "value": g(r"switch-project:\s*(true|false)", "true"),
+            "explain": "On a limit, automatically fail over to another account.",
+        },
+        {
+            "label": "Preview fallback",
+            "key": "switch-preview-model",
+            "type": "bool",
+            "value": g(r"switch-preview-model:\s*(true|false)", "false"),
+            "explain": "On: may downgrade to a cheaper/preview model on quota errors. Off: never.",
+        },
+        {
+            "label": "Spend credits",
+            "key": "antigravity-credits",
+            "type": "bool",
+            "value": g(r"antigravity-credits:\s*(true|false)", "false"),
+            "explain": "On: may spend paid credits as a last resort. Off: never.",
+        },
+        {
+            "label": "Request retries",
+            "key": "request-retry",
+            "type": "int",
+            "value": g(r"request-retry:\s*(\d+)", "0"),
+            "explain": "Retry a failed request this many times (403/408/5xx).",
+        },
+        {
+            "label": "Failover breadth",
+            "key": "max-retry-credentials",
+            "type": "int",
+            "value": g(r"max-retry-credentials:\s*(\d+)", "0"),
+            "explain": "Accounts to try on a hard failure (0 = all).",
+        },
     ]
 
 
 # ---------------------------------------------------------------- probing ---
 def codex_usage(token, account_id):
-    req = urllib.request.Request(USAGE_URL, headers={
-        "Authorization": "Bearer " + token,
-        "chatgpt-account-id": account_id or "",
-        "originator": "codex_cli_rs",
-        "OpenAI-Beta": "responses=experimental",
-        "User-Agent": UA,
-    })
+    req = urllib.request.Request(
+        USAGE_URL,
+        headers={
+            "Authorization": "Bearer " + token,
+            "chatgpt-account-id": account_id or "",
+            "originator": "codex_cli_rs",
+            "OpenAI-Beta": "responses=experimental",
+            "User-Agent": UA,
+        },
+    )
     with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
         return json.loads(r.read().decode("utf-8"))
 
@@ -145,79 +196,181 @@ def window_label(secs):
     if 6 * 86400 <= secs <= 8 * 86400:
         return "weekly"
     d = round(secs / 86400)
-    return f"{d}d" if d >= 1 else f"{round(secs/3600)}h"
+    return f"{d}d" if d >= 1 else f"{round(secs / 3600)}h"
 
 
 def make_window(w):
     if not isinstance(w, dict):
         return None
-    return {"used": w.get("used_percent"), "reset_at": w.get("reset_at"),
-            "reset_after": w.get("reset_after_seconds"),
-            "label": window_label(w.get("limit_window_seconds"))}
+    return {
+        "used": w.get("used_percent"),
+        "reset_at": w.get("reset_at"),
+        "reset_after": w.get("reset_after_seconds"),
+        "label": window_label(w.get("limit_window_seconds")),
+    }
 
 
 def claude_usage(token):
-    req = urllib.request.Request(CLAUDE_USAGE_URL, headers={
-        "Authorization": "Bearer " + token,
-        "anthropic-version": "2023-06-01",
-        "anthropic-beta": "oauth-2025-04-20,claude-code-20250219",
-        "User-Agent": CLAUDE_UA,
-    })
+    req = urllib.request.Request(
+        CLAUDE_USAGE_URL,
+        headers={
+            "Authorization": "Bearer " + token,
+            "anthropic-version": "2023-06-01",
+            "anthropic-beta": "oauth-2025-04-20,claude-code-20250219",
+            "User-Agent": CLAUDE_UA,
+        },
+    )
     with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
         return json.loads(r.read().decode("utf-8"))
+
+
+def parse_reset_ts(iso):
+    if not iso:
+        return None, None
+    try:
+        at = int(datetime.fromisoformat(iso).timestamp())
+        return at, max(0, at - int(time.time()))
+    except Exception:  # noqa: BLE001
+        return None, None
 
 
 def make_claude_window(w, label):
     if not isinstance(w, dict):
         return None
     util = w.get("utilization")
-    reset_at = reset_after = None
-    ra = w.get("resets_at")
-    if ra:
-        try:
-            reset_at = int(datetime.fromisoformat(ra).timestamp())
-            reset_after = max(0, reset_at - int(time.time()))
-        except Exception:                                      # noqa: BLE001
-            pass
-    return {"used": round(util) if isinstance(util, (int, float)) else None,
-            "reset_at": reset_at, "reset_after": reset_after, "label": label}
+    reset_at, reset_after = parse_reset_ts(w.get("resets_at"))
+    return {
+        "used": round(util) if isinstance(util, (int, float)) else None,
+        "reset_at": reset_at,
+        "reset_after": reset_after,
+        "label": label,
+    }
 
 
-def probe_claude(name, token, base):
-    """Claude usage via /api/oauth/usage â€” polled at most every CLAUDE_USAGE_TTL
-    seconds and cached, because Anthropic rate-limits this endpoint hard."""
-    now = time.time()
+def claude_extra_windows(data):
+    """Scoped limits from the newer `limits` array (e.g. a per-model weekly cap,
+    often the binding one). session/weekly_all are already the two main bars."""
+    out = []
+    for lim in data.get("limits") or []:
+        if not isinstance(lim, dict) or lim.get("kind") in ("session", "weekly_all"):
+            continue
+        pct = lim.get("percent")
+        if not isinstance(pct, (int, float)):
+            continue
+        model = ((lim.get("scope") or {}).get("model") or {}).get("display_name")
+        grp = "wk" if lim.get("group") == "weekly" else (lim.get("group") or "")
+        label = f"{model} {grp}".strip() if model else (lim.get("kind") or "limit")
+        reset_at, reset_after = parse_reset_ts(lim.get("resets_at"))
+        out.append({"used": round(pct), "reset_at": reset_at, "reset_after": reset_after, "label": label})
+    return out
+
+
+def claude_token_expired(d):
+    exp = d.get("expired")
+    if not exp:
+        return False
+    try:
+        return datetime.fromisoformat(exp).timestamp() <= time.time() + 120
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def refresh_claude_token(path, d):
+    """Refresh an expired Claude access token in place. The broker only refreshes
+    tokens it routes traffic through, so an idle Claude auth file goes stale —
+    and the usage endpoint answers 429 (not 401!) to a dead token."""
+    body = json.dumps(
+        {"grant_type": "refresh_token", "refresh_token": d["refresh_token"], "client_id": CLAUDE_CLIENT_ID}
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        CLAUDE_TOKEN_URL,
+        data=body,
+        headers={"Content-Type": "application/json", "User-Agent": CLAUDE_UA},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+        t = json.loads(r.read().decode("utf-8"))
+    now = datetime.now().astimezone()
+    d["access_token"] = t["access_token"]
+    if t.get("refresh_token"):
+        d["refresh_token"] = t["refresh_token"]
+    d["expired"] = (now + timedelta(seconds=int(t.get("expires_in", 28800)))).isoformat(timespec="seconds")
+    d["last_refresh"] = now.isoformat(timespec="seconds")
+    write_json_atomic(path, d)
+
+
+def probe_claude(path, d, base):
+    """Claude usage via /api/oauth/usage. Successes are cached for
+    CLAUDE_USAGE_TTL; failures back off (doubling, capped) instead of
+    hammering an endpoint that rate-limits hard."""
+    name, now = os.path.basename(path), time.time()
     cached = _claude_cache.get(name)
-    data, stale = None, False
+    fail = _claude_fail.get(name)
+    data, stale_note = None, None
+
     if cached and now - cached["ts"] < CLAUDE_USAGE_TTL:
         data = cached["data"]
+    elif fail and now < fail["until"]:
+        if cached:
+            data, stale_note = cached["data"], fail["err"]
+        else:
+            wait = max(1, int(fail["until"] - now))
+            return {**base, "state": fail["state"], "tracked": False, "detail": f"{fail['err']} — next try in {wait}s"}
     else:
+        state = "unreach"
         try:
-            data = claude_usage(token)
+            with _claude_refresh_lock:
+                if claude_token_expired(d):
+                    try:
+                        refresh_claude_token(path, d)
+                    except Exception as re_:  # noqa: BLE001
+                        state = "autherr"
+                        raise RuntimeError(
+                            f"token expired; auto-refresh failed ({str(re_)[:60]}) — re-add the account"
+                        ) from re_
+            data = claude_usage(d["access_token"])
             _claude_cache[name] = {"data": data, "ts": now}
-        except urllib.error.HTTPError as e:
-            if cached:
-                data, stale = cached["data"], True            # keep last-known on 429/etc.
-            elif e.code == 401:
-                return {**base, "state": "autherr", "detail": "token expired / unauthorized"}
-            elif e.code == 429:
-                return {**base, "state": "ok", "tracked": False,
-                        "detail": "Claude usage rate-limited by Anthropic â€” retrying soon"}
+            _claude_fail.pop(name, None)
+        except Exception as e:  # noqa: BLE001
+            cool = min(fail["cooldown"] * 2 if fail else FAIL_COOLDOWN_START, FAIL_COOLDOWN_MAX)
+            if isinstance(e, urllib.error.HTTPError):
+                try:
+                    cool = max(cool, int(e.headers.get("retry-after") or 0))
+                except ValueError:
+                    pass
+                if e.code == 401:
+                    state, err = "autherr", "token rejected (401) — re-add the account"
+                elif e.code == 429:
+                    state, err = "ok", "usage endpoint throttled (429) — the account itself is not limited"
+                else:
+                    err = f"usage probe HTTP {e.code}"
             else:
-                return {**base, "state": "ok", "tracked": False, "detail": f"usage HTTP {e.code}"}
-        except Exception as e:                                 # noqa: BLE001
+                err = str(e)[:110] or e.__class__.__name__
+            _claude_fail[name] = {"until": now + cool, "cooldown": cool, "err": err, "state": state}
             if cached:
-                data, stale = cached["data"], True
+                data, stale_note = cached["data"], err
+            elif state == "autherr":
+                return {**base, "state": "autherr", "detail": err}
             else:
-                return {**base, "state": "ok", "tracked": False, "detail": str(e)[:80]}
+                return {**base, "state": state, "tracked": False, "detail": f"{err} — retrying in {int(cool)}s"}
 
     fh = make_claude_window(data.get("five_hour"), "5h")
     sd = make_claude_window(data.get("seven_day"), "weekly")
-    reached = ((fh and fh["used"] is not None and fh["used"] >= 100) or
-               (sd and sd["used"] is not None and sd["used"] >= 100))
-    return {**base, "tracked": True, "stale": stale,
-            "state": "limited" if reached else "ok",
-            "primary": fh, "secondary": sd}
+    reached = (fh and fh["used"] is not None and fh["used"] >= 100) or (
+        sd and sd["used"] is not None and sd["used"] >= 100
+    )
+    out = {
+        **base,
+        "tracked": True,
+        "state": "limited" if reached else "ok",
+        "primary": fh,
+        "secondary": sd,
+        "extras": claude_extra_windows(data),
+    }
+    if stale_note:
+        out["stale"] = True
+        out["stale_note"] = f"showing {int(now - cached['ts']) // 60}m-old data — {stale_note}"
+    return out
 
 
 def probe_file(path):
@@ -225,9 +378,15 @@ def probe_file(path):
     try:
         with open(path, "r", encoding="utf-8") as fh:
             d = json.load(fh)
-    except Exception as e:                                     # noqa: BLE001
-        return {"email": name, "file": name, "provider": "?", "plan": "?",
-                "state": "error", "detail": f"unreadable token file: {e}"}
+    except Exception as e:  # noqa: BLE001
+        return {
+            "email": name,
+            "file": name,
+            "provider": "?",
+            "plan": "?",
+            "state": "error",
+            "detail": f"unreadable token file: {e}",
+        }
 
     provider = (d.get("type") or name.split("-", 1)[0]).lower()
     email = d.get("email") or name
@@ -239,60 +398,90 @@ def probe_file(path):
         return {**base, "state": "error", "detail": "no access token in file"}
 
     if provider == "claude":
-        return probe_claude(name, token, base)
+        return probe_claude(path, d, base)
     # Other providers don't expose a zero-cost usage endpoint we chart.
     if provider != "codex":
-        return {**base, "state": "ok", "tracked": False,
-                "detail": f"{provider} account â€” logged in (usage not tracked here)"}
+        return {
+            **base,
+            "state": "ok",
+            "tracked": False,
+            "detail": f"{provider} account — logged in (usage not tracked here)",
+        }
 
     try:
         u = codex_usage(token, d.get("account_id"))
     except urllib.error.HTTPError as e:
-        return {**base, "state": "autherr",
-                "detail": "token expired / unauthorized" if e.code == 401 else f"HTTP {e.code}"}
-    except Exception as e:                                     # noqa: BLE001
+        return {
+            **base,
+            "state": "autherr",
+            "detail": "token expired / unauthorized" if e.code == 401 else f"HTTP {e.code}",
+        }
+    except Exception as e:  # noqa: BLE001
         return {**base, "state": "unreach", "detail": str(e)[:80]}
 
     rl = u.get("rate_limit") or {}
     reached = bool(rl.get("limit_reached"))
-    return {**base, "tracked": True,
-            "email": u.get("email") or email,
-            "plan": u.get("plan_type") or "codex",
-            "state": "limited" if reached else "ok",
-            "primary": make_window(rl.get("primary_window")),
-            "secondary": make_window(rl.get("secondary_window"))}
+    # Position by computed label, not by which API field it arrived in. Once
+    # both windows are exhausted, the API stops reporting a separate 5h window
+    # and puts the (now binding) weekly window in primary_window instead — take
+    # that literally and the 5h bar shows weekly data instead of "n/a" (2026-07-18).
+    raw_primary = make_window(rl.get("primary_window"))
+    raw_secondary = make_window(rl.get("secondary_window"))
+    windows = [w for w in (raw_primary, raw_secondary) if w]
+    five_hour = next((w for w in windows if w["label"] == "5h"), None)
+    weekly = next((w for w in windows if w["label"] == "weekly"), None)
+    return {
+        **base,
+        "tracked": True,
+        "email": u.get("email") or email,
+        "plan": u.get("plan_type") or "codex",
+        "state": "limited" if reached else "ok",
+        "primary": five_hour,
+        "secondary": weekly,
+    }
 
 
 def refresh_once():
-    files = [p for p in sorted(glob.glob(os.path.join(AUTH_DIR, AUTH_GLOB)))
-             if not os.path.basename(p).lower().startswith("config")]
+    files = [
+        p
+        for p in sorted(glob.glob(os.path.join(AUTH_DIR, AUTH_GLOB)))
+        if not os.path.basename(p).lower().startswith("config")
+    ]
     if not files:
-        return {"ok": False, "ts": time.time(), "settings": read_settings(),
-                "error": f"no account json files in {AUTH_DIR}", "accounts": []}
+        return {
+            "ok": False,
+            "ts": time.time(),
+            "settings": read_settings(),
+            "error": f"no account json files in {AUTH_DIR}",
+            "accounts": [],
+        }
     with ThreadPoolExecutor(max_workers=8) as ex:
         accounts = list(ex.map(probe_file, files))
 
     for a in accounts:
-        used = (a.get("primary") or {}).get("used")
-        h = _history.setdefault(a["file"], [])      # key by file: emails can collide across providers
-        h.append(used)
+        # Chart the binding window: the 5h window when the API reports one,
+        # else weekly (OpenAI now reports only a weekly window on some plans).
+        prim, sec = a.get("primary") or {}, a.get("secondary") or {}
+        w = prim if prim.get("used") is not None else sec
+        h = _history.setdefault(a["file"], [])  # key by file: emails can collide across providers
+        h.append(w.get("used"))
         del h[:-HISTORY_LEN]
         a["spark"] = list(h)
+        a["spark_label"] = w.get("label") or "—"
 
     rank = {"limited": 0, "autherr": 1, "unreach": 1, "error": 1, "ok": 2, "disabled": 3}
 
     def worst(a):
-        return max((a.get("primary") or {}).get("used") or 0,
-                   (a.get("secondary") or {}).get("used") or 0)
+        return max((a.get("primary") or {}).get("used") or 0, (a.get("secondary") or {}).get("used") or 0)
 
     accounts.sort(key=lambda a: (rank.get(a["state"], 5), -worst(a), a["email"]))
-    summary = {"ok": sum(a["state"] == "ok" for a in accounts),
-               "limited": sum(a["state"] == "limited" for a in accounts),
-               "other": sum(a["state"] in ("disabled", "autherr", "unreach", "error")
-                            for a in accounts),
-               "total": len(accounts)}
-    return {"ok": True, "ts": time.time(), "summary": summary,
-            "settings": read_settings(), "accounts": accounts}
+    summary = {
+        "ok": sum(a["state"] == "ok" for a in accounts),
+        "limited": sum(a["state"] == "limited" for a in accounts),
+        "other": sum(a["state"] in ("disabled", "autherr", "unreach", "error") for a in accounts),
+        "total": len(accounts),
+    }
+    return {"ok": True, "ts": time.time(), "summary": summary, "settings": read_settings(), "accounts": accounts}
 
 
 def refresher():
@@ -300,7 +489,7 @@ def refresher():
     while True:
         try:
             snap = refresh_once()
-        except Exception as e:                                 # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
             snap = {"ok": False, "ts": time.time(), "error": str(e), "accounts": []}
         with _lock:
             _snapshot = snap
@@ -318,8 +507,7 @@ def force_refresh():
 def resolve_file(file):
     """Validate a client-supplied file name and return its absolute path."""
     base = os.path.basename(file or "")
-    if (not base or base != file or not fnmatch(base, AUTH_GLOB)
-            or base.lower().startswith("config")):
+    if not base or base != file or not fnmatch(base, AUTH_GLOB) or base.lower().startswith("config"):
         raise ValueError("invalid account file")
     path = os.path.join(AUTH_DIR, base)
     if not os.path.isfile(path):
@@ -329,7 +517,7 @@ def resolve_file(file):
 
 def write_json_atomic(path, obj):
     tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:               # utf-8, no BOM
+    with open(tmp, "w", encoding="utf-8") as fh:  # utf-8, no BOM
         json.dump(obj, fh, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
 
@@ -356,14 +544,18 @@ def remove_account(file, confirm):
 
 
 EDITABLE = {
-    "strategy": {"type": "enum", "options": ["round-robin", "fill-first"],
-                 "re": r'(strategy:\s*)"?[a-z\-]+"?', "quote": True},
-    "session-affinity": {"type": "bool", "re": r'(session-affinity:\s*)(?:true|false)'},
-    "switch-project": {"type": "bool", "re": r'(switch-project:\s*)(?:true|false)'},
-    "switch-preview-model": {"type": "bool", "re": r'(switch-preview-model:\s*)(?:true|false)'},
-    "antigravity-credits": {"type": "bool", "re": r'(antigravity-credits:\s*)(?:true|false)'},
-    "request-retry": {"type": "int", "re": r'(request-retry:\s*)\d+'},
-    "max-retry-credentials": {"type": "int", "re": r'(max-retry-credentials:\s*)\d+'},
+    "strategy": {
+        "type": "enum",
+        "options": ["round-robin", "fill-first"],
+        "re": r'(strategy:\s*)"?[a-z\-]+"?',
+        "quote": True,
+    },
+    "session-affinity": {"type": "bool", "re": r"(session-affinity:\s*)(?:true|false)"},
+    "switch-project": {"type": "bool", "re": r"(switch-project:\s*)(?:true|false)"},
+    "switch-preview-model": {"type": "bool", "re": r"(switch-preview-model:\s*)(?:true|false)"},
+    "antigravity-credits": {"type": "bool", "re": r"(antigravity-credits:\s*)(?:true|false)"},
+    "request-retry": {"type": "int", "re": r"(request-retry:\s*)\d+"},
+    "max-retry-credentials": {"type": "int", "re": r"(max-retry-credentials:\s*)\d+"},
 }
 
 
@@ -390,7 +582,7 @@ def set_setting(key, value):
     if n == 0:
         raise ValueError(f"'{key}' not found in config.yaml")
     tmp = CONFIG_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:                # utf-8, no BOM
+    with open(tmp, "w", encoding="utf-8") as fh:  # utf-8, no BOM
         fh.write(new)
     os.replace(tmp, CONFIG_PATH)
 
@@ -408,14 +600,17 @@ def load_chains():
             d = json.load(fh)
         if isinstance(d, dict) and d:
             return {str(k): [str(m) for m in v] for k, v in d.items() if isinstance(v, list)}
-    except Exception:                                          # noqa: BLE001
+    except Exception:  # noqa: BLE001
         pass
     return dict(DEFAULT_CHAINS)
 
 
 def save_chains(d):
-    clean = {str(k).strip(): [str(m).strip() for m in v if str(m).strip()]
-             for k, v in (d or {}).items() if str(k).strip() and isinstance(v, list)}
+    clean = {
+        str(k).strip(): [str(m).strip() for m in v if str(m).strip()]
+        for k, v in (d or {}).items()
+        if str(k).strip() and isinstance(v, list)
+    }
     tmp = CHAINS_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(clean, fh, indent=2)
@@ -428,10 +623,16 @@ def start_login(provider="codex"):
     if not os.path.exists(BROKER_EXE):
         raise FileNotFoundError(f"broker exe not found: {BROKER_EXE}")
     out = open(LOGIN_LOG, "a", encoding="utf-8")
-    flags = 0x00000008 | 0x00000200   # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
-    subprocess.Popen([BROKER_EXE, flag, "-config", CONFIG_PATH],
-                     cwd=APP_DIR, stdout=out, stderr=out, stdin=subprocess.DEVNULL,
-                     creationflags=flags, close_fds=True)
+    flags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    subprocess.Popen(
+        [BROKER_EXE, flag, "-config", CONFIG_PATH],
+        cwd=APP_DIR,
+        stdout=out,
+        stderr=out,
+        stdin=subprocess.DEVNULL,
+        creationflags=flags,
+        close_fds=True,
+    )
 
 
 # ---------------------------------------------------------------- page ------
@@ -482,14 +683,14 @@ PAGE = r"""<!doctype html>
          cursor:pointer;padding:0 3px;border-radius:5px}
   .kebab:hover{color:var(--txt);background:var(--track)}
   .bars{margin-top:7px;display:flex;flex-direction:column;gap:6px}
-  .bar{display:grid;grid-template-columns:34px 1fr auto;align-items:center;gap:8px}
+  .bar{display:grid;grid-template-columns:48px 1fr auto;align-items:center;gap:8px}
   .bar .lbl{font-size:10.5px;color:var(--dim)}
   .track{height:9px;background:var(--track);border-radius:5px;overflow:hidden}
   .fill{height:100%;border-radius:5px;transition:width .4s}
   .fill.green{background:var(--green)}.fill.amber{background:var(--amber)}.fill.red{background:var(--red)}
   .val{font-size:11px;font-variant-numeric:tabular-nums;white-space:nowrap;color:var(--dim)}
   .val b{color:var(--txt)}
-  .trend{margin-top:7px;display:grid;grid-template-columns:34px 1fr;align-items:center;gap:8px}
+  .trend{margin-top:7px;display:grid;grid-template-columns:48px 1fr;align-items:center;gap:8px}
   .trend .lbl{font-size:10px;color:var(--grey)}
   .spark{width:100%;height:20px;display:block}.spark-na{font-size:10px;color:var(--grey)}
   .note{margin-top:6px;font-size:11px;color:var(--dim)}
@@ -545,7 +746,7 @@ PAGE = r"""<!doctype html>
       <option value="xai">xAI / Grok</option>
       <option value="qwen">Qwen</option>
     </select>
-    <button id="addbtn" class="addbtn">ï¼‹ Add account</button>
+    <button id="addbtn" class="addbtn">＋ Add account</button>
     <div class="pills" id="pills"></div>
     <div class="meta" id="meta"></div>
   </header>
@@ -557,7 +758,7 @@ PAGE = r"""<!doctype html>
       <h2 class="side-h2b">Fallback chains</h2><div id="chains"></div>
     </aside>
   </div>
-  <footer>bars = current 5h &amp; weekly usage Â· sparkline = 5h-limit usage over the last hour Â· refreshes every __REFRESH__s</footer>
+  <footer>bars = rate-limit windows the provider reports (n/a = not reported) · sparkline = binding-window usage over the last hour · refreshes every __REFRESH__s</footer>
 </div>
 <script>
 const REFRESH = __REFRESH__ * 1000;
@@ -583,11 +784,11 @@ function bar(label,w){
   const reset = w.reset_at ? `<span data-at="${w.reset_at}">${cd(w.reset_after)}</span>` : "";
   return `<div class="bar"><span class="lbl">${w.label||label}</span>
     <div class="track"><div class="fill ${color(w.used)}" style="width:${w.used}%"></div></div>
-    <span class="val"><b>${w.used}%</b>${reset?` Â· â†» ${reset}`:""}</span></div>`;
+    <span class="val"><b>${w.used}%</b>${reset?` · ↻ ${reset}`:""}</span></div>`;
 }
 function sparkline(arr){
   const pts=(arr||[]).filter(v=>v!=null);
-  if(pts.length<2) return `<span class="spark-na">collecting trendâ€¦</span>`;
+  if(pts.length<2) return `<span class="spark-na">collecting trend…</span>`;
   const W=100,H=20, step=W/(pts.length-1);
   const line=pts.map((v,i)=>`${(i*step).toFixed(1)},${(H-(v/100)*H).toFixed(1)}`).join(" ");
   const c=stroke(pts[pts.length-1]);
@@ -619,7 +820,7 @@ function render(d){
   const grid=document.getElementById("grid"), pills=document.getElementById("pills"), meta=document.getElementById("meta");
   meta.textContent="updated "+new Date().toLocaleTimeString();
   renderSettings(d.settings);
-  if(!d.ok){ pills.innerHTML=""; grid.innerHTML=`<div class="err">âš  ${esc(d.error||"no data")}</div>`; return; }
+  if(!d.ok){ pills.innerHTML=""; grid.innerHTML=`<div class="err">⚠ ${esc(d.error||"no data")}</div>`; return; }
   const s=d.summary;
   pills.innerHTML=`<span class="pill green"><b>${s.ok}</b> ok</span>`+
     `<span class="pill red"><b>${s.limited}</b> limited</span>`+
@@ -630,8 +831,10 @@ function render(d){
     const enable = a.state==="disabled";
     let inner;
     if((a.state==="ok"||a.state==="limited") && a.tracked){
-      inner=`<div class="bars">${bar("5h",a.primary)}${bar("weekly",a.secondary)}</div>
-        <div class="trend"><span class="lbl" title="5-hour usage over the last hour">5h</span>${sparkline(a.spark)}</div>`;
+      const extras=(a.extras||[]).map(w=>bar(w.label,w)).join("");
+      const stale=a.stale?`<div class="note">⚠ ${esc(a.stale_note||"showing cached data")}</div>`:"";
+      inner=`<div class="bars">${bar("5h",a.primary)}${bar("weekly",a.secondary)}${extras}</div>
+        <div class="trend"><span class="lbl" title="binding-window usage over the last hour">${esc(a.spark_label||"5h")}</span>${sparkline(a.spark)}</div>${stale}`;
     }else{ inner=`<div class="note">${esc(a.detail||stateLabel(a.state))}</div>`; }
     return `<div class="card" data-file="${esc(a.file)}" data-email="${esc(a.email)}">
       <div class="top">
@@ -639,11 +842,11 @@ function render(d){
         <span class="email">${esc(a.email)}</span>
         <span class="badge ${plan}">${esc(a.plan)}</span>
         <span class="st ${a.state}">${stateLabel(a.state)}</span>
-        <button class="kebab" title="account actions">â‹¯</button>
+        <button class="kebab" title="account actions">⋯</button>
       </div>${inner}
       <div class="actions" hidden>
         <button class="act-toggle" data-enable="${enable?1:0}">${enable?"Enable":"Disable"}</button>
-        <button class="act-remove">Removeâ€¦</button>
+        <button class="act-remove">Remove…</button>
       </div>
       <div class="confirm" hidden>
         <div class="cmsg">To remove, type the account email <b>${esc(a.email)}</b> exactly:</div>
@@ -689,7 +892,7 @@ async function mutate(action, params, btn){
 
 document.getElementById("addbtn").addEventListener("click", async (e)=>{
   const b=e.target, provider=document.getElementById("provider").value;
-  b.disabled=true; toast("Starting "+provider+" loginâ€¦");
+  b.disabled=true; toast("Starting "+provider+" login…");
   try{
     const r=await fetch("/api/add-account?provider="+encodeURIComponent(provider),{method:"POST"});
     const j=await r.json();
@@ -730,7 +933,7 @@ document.getElementById("settings").addEventListener("change", async (e)=>{
   try{
     const r=await fetch(`/api/setting?key=${encodeURIComponent(key)}&value=${encodeURIComponent(value)}`,{method:"POST"});
     const j=await r.json();
-    toast(j.ok? `${key} â†’ ${value}` : (j.error||"save failed"), !j.ok);
+    toast(j.ok? `${key} → ${value}` : (j.error||"save failed"), !j.ok);
     await load();
   }catch(err){ toast("Request failed: "+err, true); }
 });
@@ -738,13 +941,13 @@ document.getElementById("settings").addEventListener("change", async (e)=>{
 function chainRow(alias,models){
   return `<div class="chrow"><input class="ca" value="${esc(alias)}" placeholder="alias">`+
     `<input class="cm" value="${esc((models||[]).join(', '))}" placeholder="model-a, model-b">`+
-    `<button class="cx" title="remove">Ã—</button></div>`;
+    `<button class="cx" title="remove">×</button></div>`;
 }
 function renderChains(chains){
   const el=document.getElementById("chains");
   el.innerHTML=Object.entries(chains||{}).map(([a,m])=>chainRow(a,m)).join("")
     +`<div class="chbtns"><button id="chAdd">+ chain</button><button id="chSave">Save</button></div>`
-    +`<div class="sexp">A request to an alias tries each model leftâ†’right, falling to the next on a rate-limit. Point your client's base URL at this server's <b>/v1</b> and use an alias (or any model) as the model name.</div>`;
+    +`<div class="sexp">A request to an alias tries each model left→right, falling to the next on a rate-limit. Point your client's base URL at this server's <b>/v1</b> and use an alias (or any model) as the model name.</div>`;
   el.onclick=(e)=>{ if(e.target.classList.contains("cx")) e.target.closest(".chrow").remove(); };
   document.getElementById("chAdd").onclick=()=>el.querySelector(".chbtns").insertAdjacentHTML("beforebegin",chainRow("",[]));
   document.getElementById("chSave").onclick=saveChains;
@@ -815,15 +1018,14 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
 
     def _proxy_error(self, code, msg):
-        self._send(code, json.dumps({"error": {"message": msg, "type": "proxy_error"}}),
-                   "application/json")
+        self._send(code, json.dumps({"error": {"message": msg, "type": "proxy_error"}}), "application/json")
 
     def _passthrough_v1(self, method, body):
         try:
             self._relay(broker_forward(self.path, method, self._proxy_headers(), body or None))
         except urllib.error.HTTPError as e:
             self._relay(e, e.code)
-        except Exception as e:                                 # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
             self._proxy_error(502, f"upstream error: {e}")
 
     def _v1_models(self):
@@ -831,7 +1033,7 @@ class Handler(BaseHTTPRequestHandler):
             data = json.loads(broker_forward("/v1/models", "GET", self._proxy_headers(), None).read())
         except urllib.error.HTTPError as e:
             return self._relay(e, e.code)
-        except Exception as e:                                 # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
             return self._proxy_error(502, f"upstream error: {e}")
         for name in load_chains():
             data.setdefault("data", []).append({"id": name, "object": "model", "owned_by": "fallback"})
@@ -853,9 +1055,9 @@ class Handler(BaseHTTPRequestHandler):
             except urllib.error.HTTPError as e:
                 last = e
                 if e.code in FALLBACK_STATUSES and i < len(chain) - 1:
-                    continue                                   # this model is down â€” try the next
+                    continue  # this model is down — try the next
                 return self._relay(e, e.code)
-            except Exception as e:                             # noqa: BLE001
+            except Exception as e:  # noqa: BLE001
                 last = e
                 if i < len(chain) - 1:
                     continue
@@ -869,8 +1071,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?", 1)[0]
         if path in ("/", "/index.html"):
-            self._send(200, PAGE.replace("__REFRESH__", str(REFRESH_SECONDS)),
-                       "text/html; charset=utf-8")
+            self._send(200, PAGE.replace("__REFRESH__", str(REFRESH_SECONDS)), "text/html; charset=utf-8")
         elif path == "/api/status":
             with _lock:
                 snap = dict(_snapshot)
@@ -894,7 +1095,7 @@ class Handler(BaseHTTPRequestHandler):
             v = q.get(k)
             return v[0] if v else d
 
-        # inference proxy surface (cross-model fallback) â€” same port as the dashboard
+        # inference proxy surface (cross-model fallback) — same port as the dashboard
         if u.path == "/v1/chat/completions":
             return self._chat_fallback(raw)
         if u.path.startswith("/v1/"):
@@ -910,8 +1111,13 @@ class Handler(BaseHTTPRequestHandler):
                     self._json({"ok": os.path.exists(BROKER_EXE), "dry": True, "exe": BROKER_EXE})
                     return
                 start_login(provider)
-                self._json({"ok": True, "msg": f"Opening the {provider} login in your browser. "
-                                                "Finish there; the new account shows up within a minute."})
+                self._json(
+                    {
+                        "ok": True,
+                        "msg": f"Opening the {provider} login in your browser. "
+                        "Finish there; the new account shows up within a minute.",
+                    }
+                )
             elif u.path in ("/api/account/disable", "/api/account/enable"):
                 disable = u.path.endswith("disable")
                 set_disabled(one("file"), disable)
@@ -924,10 +1130,10 @@ class Handler(BaseHTTPRequestHandler):
             elif u.path == "/api/setting":
                 set_setting(one("key"), one("value", ""))
                 force_refresh()
-                self._json({"ok": True, "msg": "Setting saved â€” broker reloads it live."})
+                self._json({"ok": True, "msg": "Setting saved — broker reloads it live."})
             else:
                 self._send(404, "not found", "text/plain")
-        except Exception as e:                                 # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
             self._json({"ok": False, "error": str(e)})
 
     def log_message(self, *a):

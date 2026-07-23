@@ -2,8 +2,8 @@
 
 A tiny, dependency-free dashboard for [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)
 that puts all your pooled **ChatGPT / Codex** accounts on one page: how much of each
-account's **5-hour** and **weekly** limit is used, when it resets, and which accounts have
-headroom right now.
+account's rate-limit windows (5-hour / weekly / model-scoped) is used, when they reset, and
+which accounts have headroom right now.
 
 CLIProxyAPI lets local AI tools share a pool of ChatGPT subscription logins behind one
 endpoint and rotates between them. This repo is a small self-hosted toolkit on top of it:
@@ -23,8 +23,15 @@ endpoint and rotates between them. This repo is a small self-hosted toolkit on t
 
 ## Features
 
-- 5h + weekly usage bars, live reset countdowns, and a usage sparkline
-- Status per account: ok / limited / disabled / auth-error
+- A usage bar for every window the provider reports (5h / weekly / scoped per-model caps),
+  live reset countdowns, and a sparkline of the binding window (OpenAI reports only a
+  weekly window on some plans now — the bars and trend adapt to whatever comes back)
+- Status per account: ok / limited / disabled / auth-error — with stale data labeled as
+  such, and failed probes backing off instead of hammering the API
+- Expired **Claude** tokens are refreshed automatically and written back for the broker.
+  (The broker only refreshes tokens it routes traffic through, so an idle Claude login goes
+  stale — and Anthropic's usage endpoint answers **429, not 401**, to a dead token, which
+  looks exactly like being rate-limited.)
 - ＋ Add account (Codex / Claude / Gemini / xAI / Qwen) via browser OAuth
 - Disable / Enable, and Remove with a type-the-email confirmation (the token file is moved
   to `removed-accounts/`, never hard-deleted)
